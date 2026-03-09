@@ -107,6 +107,18 @@ function resolveSessionCwd(sessionId: string): string {
   return DEFAULT_CWD;
 }
 
+// ── Session JSONL lookup ─────────────────────────────────────────────────────
+function findSessionJSONL(sessionId: string): string | null {
+  try {
+    const dirs = fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true }).filter(d => d.isDirectory());
+    for (const dir of dirs) {
+      const filePath = path.join(PROJECTS_ROOT, dir.name, `${sessionId}.jsonl`);
+      if (fs.existsSync(filePath)) return filePath;
+    }
+  } catch { }
+  return null;
+}
+
 // ── Tab naming (via stop hook) ───────────────────────────────────────────────
 function readConversationPairs(jsonlPath: string, maxPairs = 1): { user: string; assistant: string }[] {
   try {
@@ -139,21 +151,28 @@ function readConversationPairs(jsonlPath: string, maxPairs = 1): { user: string;
   } catch { return []; }
 }
 
-function generateName(sessionId: string, tabId: string, transcriptPath: string) {
-  // Check cache first
-  if (nameCache[sessionId]) {
+function generateName(sessionId: string, tabId: string, transcriptPath: string, forceRegenerate = false) {
+  // Check cache first (skip if regenerating)
+  if (!forceRegenerate && nameCache[sessionId]) {
     log('tab naming: cached', sessionId, '→', nameCache[sessionId]);
     tabNames.set(tabId, nameCache[sessionId]);
     broadcastSessions();
     return;
   }
 
-  log('tab naming: reading', transcriptPath);
-  const pairs = readConversationPairs(transcriptPath, 1);
+  const maxPairs = forceRegenerate ? 5 : 1;
+  log('tab naming: reading', transcriptPath, `(${maxPairs} pairs)`);
+  const pairs = readConversationPairs(transcriptPath, maxPairs);
   if (!pairs.length) { log('tab naming: no conversation pairs found in', transcriptPath); return; }
   log('tab naming: found pair, user:', pairs[0].user.slice(0, 80));
 
-  const prompt = `Give a 2-3 word tab title for this user message. Output ONLY the title, nothing else. No quotes. No punctuation.\n\nUser message: ${pairs[0].user}`;
+  let prompt: string;
+  if (pairs.length === 1) {
+    prompt = `Give a 2-3 word tab title for this user message. Output ONLY the title, nothing else. No quotes. No punctuation.\n\nUser message: ${pairs[0].user}`;
+  } else {
+    const conversation = pairs.map(p => `User: ${p.user}\nAssistant: ${p.assistant}`).join('\n\n');
+    prompt = `Give a 2-3 word tab title for this conversation. Output ONLY the title, nothing else. No quotes. No punctuation.\n\n${conversation}`;
+  }
 
   log('tab naming: asking haiku for', sessionId);
   const proc = execFile('claude', ['-p', '--model', 'haiku', '--permission-mode', 'bypassPermissions'], {
@@ -386,6 +405,16 @@ wsServer.on('connection', (ws: WebSocket) => {
             .map(s => ({ id: s.id, title: nameCache[s.id] || s.title, timestamp: s.timestamp, source: s.source }));
           log(`history_request: returning ${sessions.length} sessions (${sessions.filter(s => s.source?.includes('pi')).length} pi)`);
           ws.send(JSON.stringify({ type: 'history', sessions }));
+          break;
+        }
+        case 'regenerate_name': {
+          const { sessionId } = msg;
+          if (!sessionId) break;
+          const jsonlPath = findSessionJSONL(sessionId);
+          if (!jsonlPath) { log('regenerate: no JSONL found for', sessionId); break; }
+          // Use a synthetic tabId — if this session has a live tab, find it
+          const liveTabId = [...tabSessionIds.entries()].find(([, sid]) => sid === sessionId)?.[0];
+          generateName(sessionId, liveTabId || `regen-${sessionId}`, jsonlPath, true);
           break;
         }
       }
