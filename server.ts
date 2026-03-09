@@ -243,7 +243,7 @@ async function transcribeAudio(audioPath: string, cb: (text: string | null) => v
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
-interface SessionInfo { id: string; title: string; timestamp: string; mtime: number; }
+interface SessionInfo { id: string; title: string; timestamp: string; mtime: number; source: string; }
 
 function getHistorySessions(since = 0): SessionInfo[] {
   const sessions = new Map<string, SessionInfo>();
@@ -263,7 +263,7 @@ function getHistorySessions(since = 0): SessionInfo[] {
         if (!title) continue;
         const existing = sessions.get(sessionId);
         if (!existing || t > existing.mtime) {
-          sessions.set(sessionId, { id: sessionId, title, timestamp: entry.timestamp || '', mtime: t });
+          sessions.set(sessionId, { id: sessionId, title, timestamp: entry.timestamp || '', mtime: t, source: entry.source || '' });
         }
       }
     }
@@ -374,7 +374,7 @@ wsServer.on('connection', (ws: WebSocket) => {
           const sessions = getHistorySessions(Date.now() - 7 * 86400000)
             .sort((a, b) => b.mtime - a.mtime)
             .slice(0, 50)
-            .map(s => ({ id: s.id, title: nameCache[s.id] || s.title, timestamp: s.timestamp }));
+            .map(s => ({ id: s.id, title: nameCache[s.id] || s.title, timestamp: s.timestamp, source: s.source }));
           ws.send(JSON.stringify({ type: 'history', sessions }));
           break;
         }
