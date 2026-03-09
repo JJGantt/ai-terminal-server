@@ -362,6 +362,14 @@ wsServer.on('connection', (ws: WebSocket) => {
           ws.send(JSON.stringify({ type: 'tab_created', tabId }));
           break;
         }
+        case 'kill_tab': {
+          const p = ptySessions.get(msg.tabId);
+          if (p) {
+            log('killing tab:', msg.tabId);
+            p.kill();
+          }
+          break;
+        }
         case 'history_request': {
           const sessions = getHistorySessions(Date.now() - 7 * 86400000)
             .sort((a, b) => b.mtime - a.mtime)
