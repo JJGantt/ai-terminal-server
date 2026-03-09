@@ -116,14 +116,14 @@ function readConversationPairs(jsonlPath: string, maxPairs = 1): { user: string;
     for (const line of lines) {
       try {
         const msg = JSON.parse(line);
-        if (msg.type === 'human' || msg.role === 'user') {
+        if (msg.type === 'user' && msg.message?.role === 'user') {
           const text = typeof msg.message?.content === 'string'
             ? msg.message.content
             : Array.isArray(msg.message?.content)
               ? msg.message.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join(' ')
               : '';
           if (text) lastUser = text.slice(0, 500);
-        } else if ((msg.type === 'assistant' || msg.role === 'assistant') && lastUser) {
+        } else if (msg.type === 'assistant' && msg.message?.role === 'assistant' && lastUser) {
           const text = typeof msg.message?.content === 'string'
             ? msg.message.content
             : Array.isArray(msg.message?.content)
@@ -148,8 +148,10 @@ function generateName(sessionId: string, tabId: string, transcriptPath: string) 
     return;
   }
 
+  log('tab naming: reading', transcriptPath);
   const pairs = readConversationPairs(transcriptPath, 1);
-  if (!pairs.length) { log('tab naming: no conversation pairs found'); return; }
+  if (!pairs.length) { log('tab naming: no conversation pairs found in', transcriptPath); return; }
+  log('tab naming: found pair, user:', pairs[0].user.slice(0, 80));
 
   const prompt = `Give a 2-3 word tab title for this user message. Output ONLY the title, nothing else. No quotes. No punctuation.\n\nUser message: ${pairs[0].user}`;
 
