@@ -3,11 +3,14 @@ import * as pty from 'node-pty';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import http from 'node:http';
+import { execFile } from 'node:child_process';
 import OpenAI from 'openai';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const HOME         = os.homedir();
 const WS_PORT      = Number(process.env.WS_PORT || 27183);
+const HOOK_PORT    = Number(process.env.HOOK_PORT || 27184);
 const HISTORY_DIR  = process.env.HISTORY_DIR  || path.join(HOME, 'data/history');
 const DEFAULT_CWD  = process.env.DEFAULT_CWD  || HOME;
 const PROJECTS_ROOT = path.join(HOME, '.claude/projects');
@@ -26,11 +29,12 @@ const log = (...args: unknown[]) => {
 fs.mkdirSync(HISTORY_DIR, { recursive: true });
 
 // ── State ─────────────────────────────────────────────────────────────────────
-const ptySessions = new Map<string, ReturnType<typeof pty.spawn>>();
-const scrollback  = new Map<string, string>();
-const wsClients   = new Map<string, Set<WebSocket>>();
-const tabNames    = new Map<string, string>();
-const tabWorking  = new Map<string, boolean>();
+const ptySessions  = new Map<string, ReturnType<typeof pty.spawn>>();
+const scrollback   = new Map<string, string>();
+const wsClients    = new Map<string, Set<WebSocket>>();
+const tabNames     = new Map<string, string>();
+const tabWorking   = new Map<string, boolean>();
+const tabSessionIds = new Map<string, string>();  // tabId → sessionId
 
 let nameCache: Record<string, string> = {};
 try { nameCache = JSON.parse(fs.readFileSync(NAME_CACHE_PATH, 'utf-8')); } catch { }
@@ -70,10 +74,11 @@ function broadcastData(tabId: string, data: string) {
 }
 
 // ── Environment ───────────────────────────────────────────────────────────────
-function getCleanEnv() {
+function getCleanEnv(tabId?: string) {
   const env = { ...process.env };
   delete env.CLAUDECODE;
   delete env.CLAUDE_SESSION_ID;
+  if (tabId) env.AI_TERMINAL_TAB_ID = tabId;
   return env;
 }
 
@@ -102,6 +107,69 @@ function resolveSessionCwd(sessionId: string): string {
   return DEFAULT_CWD;
 }
 
+// ── Tab naming (via stop hook) ───────────────────────────────────────────────
+function readConversationPairs(jsonlPath: string, maxPairs = 1): { user: string; assistant: string }[] {
+  try {
+    const lines = fs.readFileSync(jsonlPath, 'utf-8').split('\n').filter(l => l.trim());
+    const pairs: { user: string; assistant: string }[] = [];
+    let lastUser = '';
+    for (const line of lines) {
+      try {
+        const msg = JSON.parse(line);
+        if (msg.type === 'human' || msg.role === 'user') {
+          const text = typeof msg.message?.content === 'string'
+            ? msg.message.content
+            : Array.isArray(msg.message?.content)
+              ? msg.message.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join(' ')
+              : '';
+          if (text) lastUser = text.slice(0, 500);
+        } else if ((msg.type === 'assistant' || msg.role === 'assistant') && lastUser) {
+          const text = typeof msg.message?.content === 'string'
+            ? msg.message.content
+            : Array.isArray(msg.message?.content)
+              ? msg.message.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join(' ')
+              : '';
+          pairs.push({ user: lastUser, assistant: (text || '').slice(0, 500) });
+          lastUser = '';
+          if (pairs.length >= maxPairs) break;
+        }
+      } catch { }
+    }
+    return pairs;
+  } catch { return []; }
+}
+
+function generateName(sessionId: string, tabId: string, transcriptPath: string) {
+  // Check cache first
+  if (nameCache[sessionId]) {
+    log('tab naming: cached', sessionId, '→', nameCache[sessionId]);
+    tabNames.set(tabId, nameCache[sessionId]);
+    broadcastSessions();
+    return;
+  }
+
+  const pairs = readConversationPairs(transcriptPath, 1);
+  if (!pairs.length) { log('tab naming: no conversation pairs found'); return; }
+
+  const prompt = `Give a 2-3 word tab title for this user message. Output ONLY the title, nothing else. No quotes. No punctuation.\n\nUser message: ${pairs[0].user}`;
+
+  log('tab naming: asking haiku for', sessionId);
+  const proc = execFile('claude', ['-p', '--model', 'haiku', '--permission-mode', 'bypassPermissions'], {
+    env: getCleanEnv(),
+    timeout: 30000,
+  }, (err, stdout) => {
+    if (err) { log('tab naming: haiku failed:', err.message); return; }
+    const name = stdout.trim();
+    if (!name || name.length > 40) { log('tab naming: bad result:', name); return; }
+    log('tab naming:', sessionId, '→', name);
+    tabNames.set(tabId, name);
+    nameCache[sessionId] = name;
+    saveNameCache();
+    broadcastSessions();
+  });
+  proc.stdin!.end(prompt);
+}
+
 // ── PTY spawn ─────────────────────────────────────────────────────────────────
 function spawnPty(id: string, resumeSessionId?: string) {
   log('spawning pty:', id, resumeSessionId ? `(resuming ${resumeSessionId})` : '');
@@ -114,7 +182,7 @@ function spawnPty(id: string, resumeSessionId?: string) {
     cols: 80,
     rows: 24,
     cwd,
-    env: getCleanEnv(),
+    env: getCleanEnv(id),
   });
 
   ptySessions.set(id, ptyProcess);
@@ -147,6 +215,7 @@ function spawnPty(id: string, resumeSessionId?: string) {
     tabWorking.delete(id);
     scrollback.delete(id);
     wsClients.delete(id);
+    tabSessionIds.delete(id);
     broadcastSessions();
   });
 }
@@ -201,6 +270,40 @@ function getHistorySessions(since = 0): SessionInfo[] {
   }
   return [...sessions.values()];
 }
+
+// ── HTTP server (for stop hook callbacks) ────────────────────────────────────
+const httpServer = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/hook') {
+    let body = '';
+    req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        const { tabId, sessionId, transcriptPath } = JSON.parse(body);
+        log('hook:', tabId, '→', sessionId);
+
+        if (tabId && sessionId) {
+          tabSessionIds.set(tabId, sessionId);
+
+          // Only generate name if still "New Session"
+          if (tabNames.get(tabId) === 'New Session' && transcriptPath) {
+            generateName(sessionId, tabId, transcriptPath);
+          }
+        }
+
+        res.writeHead(200);
+        res.end('ok');
+      } catch (err) {
+        log('hook error:', (err as Error).message);
+        res.writeHead(400);
+        res.end('bad request');
+      }
+    });
+  } else {
+    res.writeHead(404);
+    res.end('not found');
+  }
+});
+httpServer.listen(HOOK_PORT, '127.0.0.1', () => log(`Hook server on :${HOOK_PORT}`));
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wsServer = new WebSocketServer({ port: WS_PORT, host: '0.0.0.0' });
