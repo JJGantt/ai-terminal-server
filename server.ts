@@ -257,10 +257,11 @@ function getHistorySessions(since = 0): SessionInfo[] {
       for (const entry of entries) {
         const sessionId = entry.session_id || entry.sessionId;
         if (!sessionId) continue;
+        if (entry.source === 'system' || entry.source === 'system-error') continue;
         const t = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
         if (t < since) continue;
         const title = entry.summary || entry.title || (entry.user || entry.user_prompt || '').slice(0, 60);
-        if (!title) continue;
+        if (!title || title.startsWith('Give a 2-3 word tab title')) continue;
         const existing = sessions.get(sessionId);
         if (!existing || t > existing.mtime) {
           sessions.set(sessionId, { id: sessionId, title, timestamp: entry.timestamp || '', mtime: t, source: entry.source || '' });
