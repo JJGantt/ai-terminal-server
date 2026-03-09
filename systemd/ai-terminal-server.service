@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Terminal WS+PTY Server
+After=network.target tailscaled.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=jaredgantt
+WorkingDirectory=/home/jaredgantt/ai-terminal-server
+ExecStart=/usr/bin/node /home/jaredgantt/ai-terminal-server/dist/server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Env overrides — set OPENAI_API_KEY here or in ~/.env if not already in environment
+EnvironmentFile=-/home/jaredgantt/.env
+Environment=DEFAULT_CWD=/home/jaredgantt
+Environment=HISTORY_DIR=/home/jaredgantt/data/history
+
+[Install]
+WantedBy=multi-user.target
