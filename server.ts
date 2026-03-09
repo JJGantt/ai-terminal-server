@@ -259,7 +259,7 @@ function getHistorySessions(since = 0): SessionInfo[] {
         if (!sessionId) continue;
         const t = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
         if (t < since) continue;
-        const title = entry.summary || entry.title || (entry.user_prompt || '').slice(0, 60);
+        const title = entry.summary || entry.title || (entry.user || entry.user_prompt || '').slice(0, 60);
         if (!title) continue;
         const existing = sessions.get(sessionId);
         if (!existing || t > existing.mtime) {
