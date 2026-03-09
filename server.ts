@@ -152,11 +152,15 @@ function spawnPty(id: string, resumeSessionId?: string) {
 }
 
 // ── Voice transcription ───────────────────────────────────────────────────────
-const openai = new OpenAI(); // reads OPENAI_API_KEY from env
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!_openai) _openai = new OpenAI(); // reads OPENAI_API_KEY from env
+  return _openai;
+}
 
 async function transcribeAudio(audioPath: string, cb: (text: string | null) => void) {
   try {
-    const resp = await openai.audio.transcriptions.create({
+    const resp = await getOpenAI().audio.transcriptions.create({
       file: fs.createReadStream(audioPath) as any,
       model: 'whisper-1',
     });

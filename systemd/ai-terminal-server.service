@@ -13,8 +13,7 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Env overrides — set OPENAI_API_KEY here or in ~/.env if not already in environment
-EnvironmentFile=-/home/jaredgantt/.env
+EnvironmentFile=/home/jaredgantt/scripts/.env
 Environment=DEFAULT_CWD=/home/jaredgantt
 Environment=HISTORY_DIR=/home/jaredgantt/data/history
 
