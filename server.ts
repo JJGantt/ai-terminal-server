@@ -106,7 +106,7 @@ function resolveSessionCwd(sessionId: string): string {
 function spawnPty(id: string, resumeSessionId?: string) {
   log('spawning pty:', id, resumeSessionId ? `(resuming ${resumeSessionId})` : '');
   const cwd  = resumeSessionId ? resolveSessionCwd(resumeSessionId) : DEFAULT_CWD;
-  const args = ['--dangerously-skip-permissions'];
+  const args = ['--permission-mode', 'bypassPermissions'];
   if (resumeSessionId) args.push('--resume', resumeSessionId);
 
   const ptyProcess = pty.spawn('claude', args, {
