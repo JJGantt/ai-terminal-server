@@ -384,6 +384,7 @@ wsServer.on('connection', (ws: WebSocket) => {
             .sort((a, b) => b.mtime - a.mtime)
             .slice(0, 50)
             .map(s => ({ id: s.id, title: nameCache[s.id] || s.title, timestamp: s.timestamp, source: s.source }));
+          log(`history_request: returning ${sessions.length} sessions (${sessions.filter(s => s.source?.includes('pi')).length} pi)`);
           ws.send(JSON.stringify({ type: 'history', sessions }));
           break;
         }
