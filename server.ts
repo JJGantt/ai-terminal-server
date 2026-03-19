@@ -36,6 +36,7 @@ const tabNames     = new Map<string, string>();
 const tabWorking   = new Map<string, boolean>();
 const tabSessionIds = new Map<string, string>();  // tabId → sessionId
 const pendingTabs = new Map<string, string | undefined>();  // tabId → resumeSessionId (awaiting first resize)
+const wsTranscriptWatchers = new Map<string, string>(); // key → jsonlPath
 
 let nameCache: Record<string, string> = {};
 try { nameCache = JSON.parse(fs.readFileSync(NAME_CACHE_PATH, 'utf-8')); } catch { }
@@ -109,7 +110,41 @@ function resolveSessionCwd(sessionId: string): string {
   return DEFAULT_CWD;
 }
 
-// ── Session JSONL lookup ─────────────────────────────────────────────────────
+// ── Transcript parser ────────────────────────────────────────────────────────
+interface TranscriptMessage { role: 'user' | 'assistant'; text: string; }
+
+function parseTranscript(sessionId: string): TranscriptMessage[] {
+  const jsonlPath = findSessionJSONL(sessionId);
+  if (!jsonlPath) return [];
+  const messages: TranscriptMessage[] = [];
+  try {
+    const lines = fs.readFileSync(jsonlPath, 'utf-8').split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.type === 'user' && msg.message?.role === 'user') {
+          const c = msg.message.content;
+          let text = '';
+          if (typeof c === 'string') text = c;
+          else if (Array.isArray(c)) {
+            text = c.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
+          }
+          if (text.trim()) messages.push({ role: 'user', text: text.trim() });
+        } else if (msg.type === 'assistant' && msg.message?.role === 'assistant') {
+          const c = msg.message.content;
+          if (Array.isArray(c)) {
+            const text = c.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n').trim();
+            if (text) messages.push({ role: 'assistant', text });
+          }
+        }
+      } catch { }
+    }
+  } catch { }
+  return messages;
+}
+
+// ── Session JSONL lookup ────────────────────────────────────────────────────
 function findSessionJSONL(sessionId: string): string | null {
   try {
     const dirs = fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true }).filter(d => d.isDirectory());
@@ -449,6 +484,36 @@ wsServer.on('connection', (ws: WebSocket) => {
           generateName(sessionId, liveTabId || `regen-${sessionId}`, jsonlPath, true);
           break;
         }
+        case 'transcript_subscribe': {
+          const sessionId = tabSessionIds.get(msg.tabId);
+          if (!sessionId) { ws.send(JSON.stringify({ type: 'transcript', tabId: msg.tabId, messages: [] })); break; }
+          const messages = parseTranscript(sessionId);
+          ws.send(JSON.stringify({ type: 'transcript', tabId: msg.tabId, messages }));
+          const jsonlPath = findSessionJSONL(sessionId);
+          if (jsonlPath) {
+            const key = `ws:${msg.tabId}`;
+            if (!wsTranscriptWatchers.has(key)) {
+              let lastSize = 0;
+              try { lastSize = fs.statSync(jsonlPath).size; } catch {}
+              fs.watchFile(jsonlPath, { interval: 500 }, (curr) => {
+                if (curr.size <= lastSize) return;
+                lastSize = curr.size;
+                const updated = parseTranscript(sessionId);
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: 'transcript_update', tabId: msg.tabId, messages: updated }));
+                }
+              });
+              wsTranscriptWatchers.set(key, jsonlPath);
+            }
+          }
+          break;
+        }
+        case 'transcript_unsubscribe': {
+          const key = `ws:${msg.tabId}`;
+          const p = wsTranscriptWatchers.get(key);
+          if (p) { fs.unwatchFile(p); wsTranscriptWatchers.delete(key); }
+          break;
+        }
       }
     } catch (e) {
       log('ws error:', (e as Error).message);
@@ -458,6 +523,9 @@ wsServer.on('connection', (ws: WebSocket) => {
   ws.on('close', () => {
     log('client disconnected');
     if (currentTab) wsClients.get(currentTab)?.delete(ws);
+    for (const [key, p] of wsTranscriptWatchers) {
+      if (key.startsWith('ws:')) { fs.unwatchFile(p); wsTranscriptWatchers.delete(key); }
+    }
   });
 });
 
