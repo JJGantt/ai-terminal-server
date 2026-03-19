@@ -35,6 +35,7 @@ const wsClients    = new Map<string, Set<WebSocket>>();
 const tabNames     = new Map<string, string>();
 const tabWorking   = new Map<string, boolean>();
 const tabSessionIds = new Map<string, string>();  // tabId → sessionId
+const pendingTabs = new Map<string, string | undefined>();  // tabId → resumeSessionId (awaiting first resize)
 
 let nameCache: Record<string, string> = {};
 try { nameCache = JSON.parse(fs.readFileSync(NAME_CACHE_PATH, 'utf-8')); } catch { }
@@ -44,7 +45,8 @@ function saveNameCache() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function getTabList() {
-  return [...ptySessions.keys()].map(id => ({
+  const ids = new Set([...ptySessions.keys(), ...pendingTabs.keys()]);
+  return [...ids].map(id => ({
     id,
     name: tabNames.get(id) || 'New Session',
     working: tabWorking.get(id) || false,
@@ -192,16 +194,16 @@ function generateName(sessionId: string, tabId: string, transcriptPath: string, 
 }
 
 // ── PTY spawn ─────────────────────────────────────────────────────────────────
-function spawnPty(id: string, resumeSessionId?: string) {
-  log('spawning pty:', id, resumeSessionId ? `(resuming ${resumeSessionId})` : '');
+function spawnPty(id: string, resumeSessionId?: string, cols = 80, rows = 24) {
+  log('spawning pty:', id, `${cols}x${rows}`, resumeSessionId ? `(resuming ${resumeSessionId})` : '');
   const cwd  = resumeSessionId ? resolveSessionCwd(resumeSessionId) : DEFAULT_CWD;
   const args = ['--permission-mode', 'bypassPermissions'];
   if (resumeSessionId) args.push('--resume', resumeSessionId);
 
   const ptyProcess = pty.spawn('claude', args, {
     name: 'xterm-256color',
-    cols: 80,
-    rows: 24,
+    cols,
+    rows,
     cwd,
     env: getCleanEnv(id),
   });
@@ -361,7 +363,14 @@ wsServer.on('connection', (ws: WebSocket) => {
         case 'resize':
           clientCols = msg.cols;
           clientRows = msg.rows;
-          ptySessions.get(msg.tabId)?.resize(msg.cols, msg.rows);
+          // If this tab is pending (awaiting dimensions), spawn it now
+          if (pendingTabs.has(msg.tabId)) {
+            const resumeId = pendingTabs.get(msg.tabId);
+            pendingTabs.delete(msg.tabId);
+            spawnPty(msg.tabId, resumeId, msg.cols, msg.rows);
+          } else {
+            ptySessions.get(msg.tabId)?.resize(msg.cols, msg.rows);
+          }
           break;
         case 'list':
           ws.send(JSON.stringify({ type: 'sessions', tabs: getTabList() }));
@@ -381,14 +390,30 @@ wsServer.on('connection', (ws: WebSocket) => {
         }
         case 'new_tab': {
           const tabId = `pi-${Date.now()}`;
-          spawnPty(tabId);
+          if (clientCols > 0 && clientRows > 0) {
+            // Already know phone dimensions from a prior resize — spawn immediately
+            spawnPty(tabId, undefined, clientCols, clientRows);
+          } else {
+            // First tab — defer spawn until phone sends resize with actual dimensions
+            log('deferring pty spawn for', tabId, '(awaiting resize)');
+            pendingTabs.set(tabId, undefined);
+            tabNames.set(tabId, 'New Session');
+          }
           ws.send(JSON.stringify({ type: 'tab_created', tabId }));
+          broadcastSessions();
           break;
         }
         case 'resume_tab': {
           const tabId = `pi-${Date.now()}`;
-          spawnPty(tabId, msg.sessionId);
+          if (clientCols > 0 && clientRows > 0) {
+            spawnPty(tabId, msg.sessionId, clientCols, clientRows);
+          } else {
+            log('deferring pty spawn for', tabId, '(awaiting resize, resume:', msg.sessionId, ')');
+            pendingTabs.set(tabId, msg.sessionId);
+            tabNames.set(tabId, nameCache[msg.sessionId] || 'New Session');
+          }
           ws.send(JSON.stringify({ type: 'tab_created', tabId }));
+          broadcastSessions();
           break;
         }
         case 'kill_tab': {
