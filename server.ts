@@ -460,6 +460,16 @@ wsServer.on('connection', (ws: WebSocket) => {
           }
           break;
         }
+        case 'cache_name': {
+          // Mac pushes its generated names to Pi in real-time
+          const { sessionId: cacheId, name: cacheName } = msg;
+          if (cacheId && cacheName) {
+            nameCache[cacheId] = cacheName;
+            saveNameCache();
+            log(`cache_name: ${cacheId} → ${cacheName}`);
+          }
+          break;
+        }
         case 'history_request': {
           const sessions = getHistorySessions(Date.now() - 7 * 86400000)
             .sort((a, b) => b.mtime - a.mtime)
