@@ -16,6 +16,12 @@ const DEFAULT_CWD  = process.env.DEFAULT_CWD  || HOME;
 const PROJECTS_ROOT = path.join(HOME, '.claude/projects');
 const NAME_CACHE_PATH = path.join(HISTORY_DIR, 'tab-names.json');
 const MAX_SCROLLBACK  = 100 * 1024;
+const VOICE_TRANSCRIBE_BACKEND = (process.env.AI_TERMINAL_TRANSCRIBE_BACKEND || 'local-first').toLowerCase();
+const LOCAL_WHISPER_MODEL = process.env.AI_TERMINAL_WHISPER_MODEL || 'tiny.en';
+const LOCAL_WHISPER_COMPUTE_TYPE = process.env.AI_TERMINAL_WHISPER_COMPUTE_TYPE || 'int8';
+const LOCAL_WHISPER_BEAM_SIZE = Number(process.env.AI_TERMINAL_WHISPER_BEAM_SIZE || 1);
+const LOCAL_TRANSCRIBE_TIMEOUT_MS = Number(process.env.AI_TERMINAL_LOCAL_TIMEOUT_MS || 90000);
+const LOCAL_TRANSCRIBE_SCRIPT = path.join(__dirname, '..', 'scripts', 'transcribe_local.py');
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 const LOG_PATH = '/tmp/ai-terminal-server.log';
@@ -27,6 +33,7 @@ const log = (...args: unknown[]) => {
 };
 
 fs.mkdirSync(HISTORY_DIR, { recursive: true });
+log(`voice transcription backend: ${VOICE_TRANSCRIBE_BACKEND} | local model: ${LOCAL_WHISPER_MODEL}`);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const ptySessions  = new Map<string, ReturnType<typeof pty.spawn>>();
@@ -286,16 +293,93 @@ function getOpenAI(): OpenAI {
   return _openai;
 }
 
-async function transcribeAudio(audioPath: string, cb: (text: string | null) => void) {
+function getTranscriptionBackends(): ('local' | 'api')[] {
+  switch (VOICE_TRANSCRIBE_BACKEND) {
+    case 'local':
+      return ['local'];
+    case 'api':
+      return ['api'];
+    case 'api-first':
+      return ['api', 'local'];
+    case 'auto':
+    case 'local-first':
+    default:
+      return ['local', 'api'];
+  }
+}
+
+function describeTranscriptionError(err: unknown): string {
+  const error = err as any;
+  const details: string[] = [];
+  if (typeof error?.message === 'string' && error.message) details.push(error.message);
+  if (typeof error?.status === 'number') details.push(`status ${error.status}`);
+  if (typeof error?.code === 'string' && error.code) details.push(error.code);
+  if (typeof error?.cause?.code === 'string' && error.cause.code) {
+    details.push(`cause ${error.cause.code}`);
+  } else if (typeof error?.cause?.message === 'string' && error.cause.message) {
+    details.push(error.cause.message);
+  }
+  return details.join(' | ') || 'Unknown transcription error';
+}
+
+async function transcribeAudioApi(audioPath: string): Promise<string | null> {
+  const resp = await getOpenAI().audio.transcriptions.create({
+    file: fs.createReadStream(audioPath) as any,
+    model: 'whisper-1',
+  });
+  return resp.text?.trim() || null;
+}
+
+async function transcribeAudioLocal(audioPath: string): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      '/usr/bin/python3',
+      [
+        LOCAL_TRANSCRIBE_SCRIPT,
+        audioPath,
+        LOCAL_WHISPER_MODEL,
+        LOCAL_WHISPER_COMPUTE_TYPE,
+        String(LOCAL_WHISPER_BEAM_SIZE),
+      ],
+      { timeout: LOCAL_TRANSCRIBE_TIMEOUT_MS, env: getCleanEnv() },
+      (err, stdout) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        const text = stdout.trim();
+        resolve(text || null);
+      },
+    );
+  });
+}
+
+async function transcribeAudio(audioPath: string, cb: (text: string | null, error?: string) => void) {
+  const backends = getTranscriptionBackends();
+  const errors: string[] = [];
   try {
-    const resp = await getOpenAI().audio.transcriptions.create({
-      file: fs.createReadStream(audioPath) as any,
-      model: 'whisper-1',
-    });
-    cb(resp.text?.trim() || null);
+    for (const backend of backends) {
+      try {
+        log(`transcription backend: ${backend}`);
+        const text = backend === 'local'
+          ? await transcribeAudioLocal(audioPath)
+          : await transcribeAudioApi(audioPath);
+        if (text) {
+          cb(text);
+          return;
+        }
+        errors.push(`${backend}: empty transcription`);
+      } catch (err) {
+        const detail = describeTranscriptionError(err);
+        log(`transcription ${backend} error:`, detail);
+        errors.push(`${backend}: ${detail}`);
+      }
+    }
+    cb(null, errors.join(' | ') || 'Unknown transcription error');
   } catch (err) {
-    log('transcription error:', (err as Error).message);
-    cb(null);
+    const detail = describeTranscriptionError(err);
+    log('transcription error:', detail);
+    cb(null, detail);
   }
 }
 
@@ -416,8 +500,17 @@ wsServer.on('connection', (ws: WebSocket) => {
           const audioPath = '/tmp/ai-terminal-server-voice.wav';
           fs.writeFileSync(audioPath, Buffer.from(data, 'base64'));
           log(`voice: ${durationS?.toFixed(1)}s for tab ${tabId}`);
-          transcribeAudio(audioPath, (text) => {
-            if (!text) { log('voice: empty transcription'); return; }
+          transcribeAudio(audioPath, (text, error) => {
+            if (!text) {
+              const message = error
+                ? `Voice transcription failed on the server: ${error}`
+                : 'Voice transcription returned no text.';
+              log('voice: empty transcription');
+              appendScrollback(tabId, `\r\n[${message}]\r\n`);
+              broadcastData(tabId, `\r\n[${message}]\r\n`);
+              ws.send(JSON.stringify({ type: 'voice_error', tabId, error: message }));
+              return;
+            }
             const cleaned = text.replace(/[\r\n]+/g, ' ').trim();
             log('voice transcribed:', cleaned.slice(0, 100));
             ptySessions.get(tabId)?.write(cleaned + '\r');
